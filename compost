@@ -1,0 +1,771 @@
+#!/usr/bin/python3.11
+
+"""
+Provides a simple DB class and a Mapper, Config and Command class set,
+plus the corresponding migrations, type aliases and utility functions,
+variously applied for argv through an init function invoking handlers,
+with mapping via partial sets of parameters for selected Docker tasks,
+for storage, run/rerun, modification, listing and removal of commands
+"""
+
+# Imports, stdlib
+
+from __future__ import annotations
+from pathlib import Path
+from os import environ, system, remove
+from typing import Callable, Any
+from sqlite3 import connect
+from argparse import ArgumentParser
+from json import dumps, loads
+from sys import argv, stderr
+from subprocess import run
+import unittest
+
+
+# Defaults, major
+
+PATH_HOME = Path(environ["HOME"])
+PATH_DB_MAIN = PATH_HOME / '.compost.db'
+PATH_DB_TEST = PATH_HOME / '.compost_test.db'
+
+MIGRATIONS = [
+    {
+        'task_create':   'CREATE TABLE IF NOT EXISTS task (name TEXT UNIQUE)',
+        'cmnd_create': '''CREATE TABLE IF NOT EXISTS command (
+                              id INT,
+                              config JSON,
+                              task_rowid INT,
+                              FOREIGN KEY(task_rowid) REFERENCES task(rowid)
+                          )''',
+        'task_insert':   'INSERT OR IGNORE INTO task (name) VALUES ("exec"), ("run")'
+    }
+]
+
+TASKS = {
+
+    'exec': {
+
+        'parameters': [
+
+            ('--detach',      '-d', {'action': 'store_true'         }),
+            ('--env',         '-e', {'action': 'store'              }),
+            ('--interactive', '-i', {'action': 'store_true'         }),
+            ('--tty',         '-t', {'action': 'store_true'         }),
+            ('--user',        '-u', {'action': 'store'              }),
+            ('container',     '',   {'action': 'store'              }),
+            ('command',       '',   {'action': 'store', 'nargs': '*'})
+        ]
+    },
+    'run': {
+
+        'parameters': [
+
+            ('--detach',      '-d', {'action': 'store_true'         }),
+            ('--env',         '-e', {'action': 'store'              }),
+            ('--hostname',    '-h', {'action': 'store'              }),
+            ('--interactive', '-i', {'action': 'store_true'         }),
+            ('--label',       '-l', {'action': 'store'              }),
+            ('--name',        '',   {'action': 'store'              }),
+            ('--publish',     '-p', {'action': 'store'              }),
+            ('--rm',          '',   {'action': 'store_true'         }),
+            ('--tty',         '-t', {'action': 'store_true'         }),
+            ('--user',        '-u', {'action': 'store'              }),
+            ('--volume',      '-v', {'action': 'store'              }),
+            ('image',         '',   {'action': 'store'              }),
+            ('command',       '',   {'action': 'store', 'nargs': '*'})
+       ]
+    }
+}
+
+
+# Constants & type aliases
+
+IS_TEST = len(argv) > 1 and 'COMPOST_TESTING' == argv[1]
+
+MESSAGES = {
+    'cmd_none':      'No support for command',
+    'cmd_id_none':   'No command found for ID',
+    'cmd_no_update': 'Update unavailable for command with ID'
+}
+
+Migrations = list[dict[str, str]]
+TaskParams = list[tuple[str, str, dict[str, Any]]]
+ConfigVals = dict[str, dict[str, Any]]
+
+
+# Utility functions
+
+def show(message: Any, **kwargs) -> None:
+    """
+    Prints a message passed per any accompanying keyword arguments,
+    by default to stdout
+    """
+    print(str(message), **kwargs)
+
+
+def fail_with(message: str) -> None:
+    """
+    Prints a message passed to stderr then exits with error code
+    """
+    show(message, file=stderr)
+    exit(1)
+
+
+# Argument handlers
+
+def help_handle(args: list[str], db: DB) -> None:
+    """
+    Prints help text
+    """
+    tasks = '/'.join(TASKS.keys())
+    lines = [
+       f'Usage: compost docker {tasks} ...',
+       f'       compost {tasks} ID[ ...]',
+       f'       compost {tasks} ls / rm ID',
+        '       compost [--]help/-h / test'
+    ]
+    show('\n'.join(lines))
+
+
+# Data structures, general
+
+class DB:
+    """
+    Stores a connection to a database at a path subject to a set of migrations
+    """
+
+    def __init__(self, path: Path, migrations: Migrations,\
+        connect: Callable = connect) -> None:
+        """
+        Returns a DB instance with a connection and a cursor property,
+        once the connection has been made with a database at a path
+        and migrations have been performed
+        """
+        self.con = connect(path)
+        self.cur = self.con.cursor()
+
+        for migration in migrations:
+           for query in migration.values():
+               self.cur.execute(query)
+        self.con.commit()
+
+
+class Mapper:
+    """
+    Stores parameters and a parser and provides mapping methods
+    """
+
+    class _Parser(ArgumentParser):
+        """
+        Parses arguments, accruing error messages clearably without raising
+        """
+
+        messages: list[str] = []
+
+        def error(self, message: str): # -> None
+            """
+            Appends each error message to the messages property
+            """
+            self.messages.append(message)
+
+        def clear(self) -> None:
+            """
+            Resets the messages property
+            """
+            self.messages = []
+
+    def __init__(self, parameters: TaskParams) -> None:
+        """
+        Returns a Mapper instance with a parameters and a parser property
+        once the parser has been initialized per the parameters
+        """
+        self.parameters = parameters
+        self.parser = self._Parser(add_help=False)
+
+        for item in self.parameters:
+            flags = list(filter(lambda flag: flag, item[:-1]))
+            self.parser.add_argument(*flags, **item[-1])
+
+    def args_to_values(self, args: list[str], **kwargs) -> ConfigVals:
+        """
+        Returns a set of values generated from args per any kwargs,
+        including any error messages by category on the notes property and
+        args as is on the _args property if any are unrecognized
+        """
+        is_update = kwargs.get('is_update')
+        values = {
+            'pairs': self.parser.parse_args(args).__dict__,
+            '_args': {'wrng_asg': [], 'wrng_upd': []},
+            'notes': {'failures': [], 'warnings': []}
+        }
+        for message in self.parser.messages:
+            if 'required' in message:
+                if is_update: continue
+                values['notes']['failures'].append(message)
+            if 'unrecognized' in message:
+                message = f'{message}: command stored, but no update available'
+                values['notes']['warnings'].append(message)
+                key = 'wrng_upd' if is_update else 'wrng_asg'
+                values['_args'][key] = args
+        self.parser.clear()
+        return values
+
+    def values_to_args(self, values: ConfigVals) -> list[str]:
+        """
+        Returns a set of args generated from values
+        """
+        if values['_args']['wrng_asg']:
+            return values['_args']['wrng_asg']
+
+        args: list[str] = values['_args']['wrng_upd']
+
+        for item in self.parameters:
+            if item[0].startswith('--'):
+                # Optional argument
+                v = values['pairs'][item[0][2:]]
+                if v:
+                    args.extend(\
+                       [item[0]] if v is True else\
+                       [item[0], v] if isinstance(v, str) else\
+                       v\
+                    )
+            else:
+                # Positional argument
+                v = values['pairs'][item[0]]
+                if v:
+                    args.append(\
+                        ' '.join(v) if isinstance(v, list) else\
+                        v\
+                    )
+        return args
+
+    def check_no_warning(self, values: ConfigVals) -> bool:
+        """
+        Returns a boolean indicating whether values
+        contains any args accepted with a warning
+        """
+        return not values['_args']['wrng_asg'] and\
+               not values['_args']['wrng_upd']
+
+
+class Config:
+    """
+    Stores values and a mapper and provides input and output methods
+    """
+
+    def __init__(self, mapper: Mapper) -> None:
+        """
+        Returns a Config instance with a mapper and a values property
+        """
+        self.mapper = mapper
+        self.values: ConfigVals
+
+    # Input
+
+    # - assignment
+
+    def assign_from_args(self, args: list[str]) -> Config:
+        """
+        Returns the instance with the values property mapped from args
+        """
+        self.values = self.mapper.args_to_values(args)
+        return self
+
+    def assign_from_json(self, json: str) -> Config:
+        """
+        Returns the instance with the values property mapped from JSON
+        """
+        self.values = loads(json)
+        return self.assign_from_args(self.to_args())
+
+    # - update
+
+    def check_can_update(self) -> bool:
+        """
+        Returns a boolean indicating whether the values property can be updated
+        """
+        return self.mapper.check_no_warning(self.values)
+
+    def update_from_args(self, args: list[str]) -> Config:
+        """
+        Returns the instance with the values property remapped per args,
+        toggling boolean values and replacing others
+        """
+        values = self.mapper.args_to_values(args, is_update=True)
+        self.values['notes'] = values['notes']
+        self.values['_args'] = values['_args']
+        for k, v in values['pairs'].items():
+            if v is True or k not in self.values['pairs'] or\
+                (v and v != self.values['pairs'][k]):
+                self.values['pairs'][k] = not self.values['pairs'][k]\
+                     if v is True else v
+        return self
+
+    # Output
+
+    def notify(self, **kwargs) -> Config:
+        """
+        Prints any notes on the values property and exits if one or more found
+        else returns the instance
+        """
+        if not kwargs.get('is_internal'):
+            for key in self.values['notes']:
+                for body in self.values['notes'][key]:
+                   show(f'Note: {body}', file=stderr)
+            if self.values['notes']['failures']:
+                exit(1)
+        return self
+
+    def to_args(self) -> list[str]:
+        """
+        Returns a set of args mapped from the values property
+        """
+        return self.mapper.values_to_args(self.values)
+
+    def to_json(self) -> str:
+        """
+        Returns a JSON string formed from the values property
+        """
+        return dumps(self.values)
+
+
+class Command:
+    """
+    Stores the ID, task and config for a command and provides handlers,
+    instantiators and instance methods for usage, input and output,
+    including to and from the command table in a database
+    """
+
+    PROG = 'docker'
+
+    # Utilities
+
+    @staticmethod
+    def _check_is_in(db: DB, task: str, id: str) -> bool:
+        """
+        Returns a boolean indicating whether a command of a task and id
+        is stored in the command table in a database
+        """
+        q = '''SELECT *
+               FROM command
+               INNER JOIN task ON task.rowid = command.task_rowid
+               WHERE task.name = ? AND command.id = ?'''
+        return db.cur.execute(q, [task, id]).fetchone() is not None
+
+    # Handlers, public
+
+    @classmethod
+    def insert_one(cls, args: list[str], db: DB) -> None:
+        """
+        Stores a command in a database per args, prints its id property value
+        and runs the command
+        """
+        cmd = cls.of(args).insert_into(db)
+        show(cmd.id)
+        cmd.invoke()
+
+    @classmethod
+    def output_all(cls, args: list[str], db: DB) -> None:
+        """
+        Prints a list of the id and argv for each record for the task in args
+        stored in the command table in a database
+        """
+        q = '''SELECT command.id, command.config
+               FROM command
+               INNER JOIN task ON task.rowid = command.task_rowid
+               WHERE task.name = ?'''
+        task = args[0]
+        rows = db.cur.execute(q, [task]).fetchall()
+        mapper = Mapper(TASKS[task]['parameters'])
+        for row in rows:
+            id, json = row
+            args_row = Config(mapper).assign_from_json(json).to_args()
+            show(f"{id}: {' '.join([cls.PROG, task, *args_row])}")
+
+    @classmethod
+    def invoke_one(cls, args: list[str], db: DB) -> None:
+        """
+        Runs a command stored in a database per the task and id in args,
+        once the command has been updated and its id property value
+        has been printed where any additional args are present,
+        else prints a message indicating command absence
+        """
+        task, id = args[0:2]
+        if not cls._check_is_in(db, task, id):
+            fail_with(f"{MESSAGES['cmd_id_none']} {id}")
+        cmd = cls.out_of(db, task, id, is_internal=True)
+        if len(args) > 2:
+            cmd.update(args[2:]).insert_into(db)
+            show(cmd.id)
+        cmd.invoke()
+
+    @classmethod
+    def delete_one(cls, args: list[str], db: DB) -> None:
+        """
+        Removes a record in the command table in a database
+        per the task and id in args
+        else prints a message indicating command absence
+        """
+        q = '''DELETE FROM command
+               WHERE task_rowid IN (
+                   SELECT rowid FROM task WHERE name = ?
+               ) AND id = ?'''
+        task, _, id = args[0:3]
+        if not cls._check_is_in(db, task, id):
+            fail_with(f"{MESSAGES['cmd_id_none']} {id}")
+        db.cur.execute(q, [task, id])
+        db.con.commit()
+
+    # Instantiators
+
+    @classmethod
+    def of(cls, argv: list[str]) -> Command:
+        """
+        Returns a Command instance for argv via the constructor
+        """
+        return cls(argv)
+
+    @classmethod
+    def out_of(cls, db: DB, task: str, id: str, **kwargs) -> Command:
+        """
+        Returns a Command instance via the constructor
+        for a record in the command table in a database per a task and id
+        """
+        q = '''SELECT command.config
+               FROM command
+               INNER JOIN task ON task.rowid = command.task_rowid
+               WHERE task.name = ? AND command.id = ?'''
+        json = db.cur.execute(q, [task, id]).fetchone()[0]
+        args = Config(Mapper(TASKS[task]['parameters']))\
+                   .assign_from_json(json).notify(**kwargs).to_args()
+        argv = [cls.PROG, task, *args]
+        cmd = cls(argv, is_internal=True)
+        cmd.id = int(id)
+        return cmd
+
+    def __init__(self, argv: list[str], **kwargs) -> None:
+        """
+        Returns a Command instance with a task, a config and an id property
+        """
+        self.id: int | None = None
+        self.task: str = argv[1]
+        self.config = Config(Mapper(TASKS[self.task]['parameters']))\
+                          .assign_from_args(argv[2:]).notify(**kwargs)
+
+    # Instance methods
+
+    def insert_into(self, db: DB) -> Command:
+        """
+        Returns the instance once a record for it has been stored
+        in the command table in a database and
+        its id property has been updated
+        """
+        q_sel_tr =   'SELECT rowid FROM task WHERE name = ?'
+        q_sel_id = '''SELECT max(command.id)
+                      FROM command
+                      INNER JOIN task ON task.rowid = command.task_rowid
+                      WHERE task.name = ?'''
+        self.task_rowid = db.cur.execute(q_sel_tr, [self.task]).fetchone()[0]
+        self.id = int(\
+                db.cur.execute(q_sel_id, [self.task]).fetchone()[0] or '0'\
+            ) + 1
+
+        q_ins = 'INSERT INTO command VALUES(?, ?, ?)'
+        ps = [self.id, self.config.to_json(), self.task_rowid]
+        db.cur.execute(q_ins, ps)
+        db.con.commit()
+        return self
+
+    def update(self, args: list[str]) -> Command:
+        """
+        Returns the instance once its config property has been updated
+        from args and any corresponding notifications have been handled
+        else prints a message indicating command update is unavailable
+        """
+        if not self.config.check_can_update():
+            fail_with(f"{MESSAGES['cmd_no_update']} {self.id}")
+        self.config.update_from_args(args).notify()
+        return self
+
+    def invoke(self) -> Command:
+        """
+        Returns the instance once its command has been run
+        """
+        if not IS_TEST:
+            system(self.to_str())
+        return self
+
+    def to_str(self) -> str:
+        """
+        Returns the argv for the instance as a string
+        """
+        return ' '.join([self.PROG, self.task, *self.config.to_args()])
+
+
+# Instances, major
+
+db = DB(PATH_DB_MAIN if not IS_TEST else PATH_DB_TEST, MIGRATIONS)
+
+
+# Primary functions, general
+
+def init(argv: list[str] = argv) -> None:
+    """
+    Invokes a handler per argv, passing a subset and the DB instance
+    """
+
+    argc = len(argv)
+
+    argc_2_only: dict[str, Callable] = {
+
+        '-h':       help_handle,
+        '--help':   help_handle,
+        'help':     help_handle,
+        'test':     test_handle
+    }
+    argc_3_plus: dict[str, dict[str, Callable]] = {
+
+        'run':  {
+            'ls':   Command.output_all,
+            'rm':   Command.delete_one
+        },
+        'exec': {
+            'ls':   Command.output_all,
+            'rm':   Command.delete_one
+        },
+        'docker': {
+            'run':  Command.insert_one,
+            'exec': Command.insert_one
+        }
+    }
+
+    fail = lambda: fail_with(f"{MESSAGES['cmd_none']} '{' '.join(argv)}'")
+    args = argv[1:]
+
+    match argc:
+        case 1:
+            help_handle(args, db)
+        case 2:
+            if argv[1] not in argc_2_only: fail()
+            argc_2_only[argv[1]](args, db)
+        case _:
+           if argv[1] not in argc_3_plus: fail()
+           argc_3_plus[argv[1]].get(\
+               argv[2], Command.invoke_one # default handler for argv[2] is ID\
+           )(args, db)
+
+
+# Data structures & primary functions, test
+
+class TestCompost(unittest.TestCase):
+
+    _DB: DB | None = None
+    _VS: dict[str, dict[str, Any]] = {
+
+        'args': {
+            'dkr_task':      [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-de', 'TEST=test', 'test:1.0.0'],
+            'dkr_task_wrn':  [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-xyz', 'test:1.0.0'],
+            'dkr_task_err':  [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-xyz'],
+            'task_upd':      [argv[0], 'COMPOST_TESTING', 'run', '-d', 'test:1.0.1'], # ID required
+            'task_upd_warn': [argv[0], 'COMPOST_TESTING', 'run', '-xyz'],             # ID required
+            'task':          [argv[0], 'COMPOST_TESTING', 'run'],                     # ID required
+            'task_rm':       [argv[0], 'COMPOST_TESTING', 'run', 'rm'],               # ID required
+            'task_ls':       [argv[0], 'COMPOST_TESTING', 'run', 'ls'],
+            'help_word':     [argv[0], 'COMPOST_TESTING', 'help'],
+            'help_flag_w':   [argv[0], 'COMPOST_TESTING', '--help'],
+            'help_flag_c':   [argv[0], 'COMPOST_TESTING', '-h'],
+            'err_1':         [argv[0], 'COMPOST_TESTING'],
+            'err_2':         [argv[0], 'COMPOST_TESTING', 'none'],
+            'err_3':         [argv[0], 'COMPOST_TESTING', 'none', 'run']
+        },
+        'rows': {
+            'dkr_task': (1, '{"pairs": {"detach": true, "env": "TEST=test", "hostname": null, "interactive": false, "label": null, "name": null, "publish": null, "rm": false, "tty": false, "user": null, "volume": null, "image": "test:1.0.0", "command": []}, "_args": {"wrng_asg": [], "wrng_upd": []}, "notes": {"failures": [], "warnings": []}}', 2),
+            'task_upd': (2, '{"pairs": {"detach": false, "env": "TEST=test", "hostname": null, "interactive": false, "label": null, "name": null, "publish": null, "rm": false, "tty": false, "user": null, "volume": null, "image": "test:1.0.1", "command": []}, "_args": {"wrng_asg": [], "wrng_upd": []}, "notes": {"failures": [], "warnings": []}}', 2)
+        },
+        'strs': {
+            'list_dkr_task_2': '1: docker run --detach --env TEST=test test:1.0.0\n2: docker run --detach --env TEST=test test:1.0.0\n'
+        },
+        'queries': {
+            'sel_cmd_by_task': 'SELECT command.id, command.config, command.task_rowid FROM command INNER JOIN task ON task.rowid = command.task_rowid WHERE task.name = ? AND command.id = ?',
+            'sel_cmd_max_rid': 'SELECT COALESCE(MAX(rowid), 0) FROM command',
+            'sel_cmd_nxt_rid': 'SELECT COALESCE(MAX(rowid), 0) + 1 FROM command',
+            'del_cmd_max_rid': 'DELETE FROM command WHERE rowid = (SELECT MAX(rowid) from command)'
+        },
+        'sets': {
+            'keywords': ['compost', 'docker', 'exec', 'run', 'ID', 'ls', 'rm', 'help', 'test']
+        }
+    }
+
+    @classmethod
+    def setUpClass(cls):
+      cls._DB = DB(PATH_DB_TEST, MIGRATIONS)
+
+    def test_compost_docker_task(self):
+        '''"compost docker TASK ..." adds a record to the command table and prints the ID'''
+
+        cli_id = int(run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode())
+        row    = self._DB.cur.execute(self._VS['queries']['sel_cmd_by_task'], ['run', str(cli_id)]).fetchone()
+        row_id = row[0]
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertEqual(row_id, cli_id)
+        self.assertEqual(self._VS['rows']['dkr_task'][1:], row[1:])
+
+    def test_compost_docker_task_error(self):
+        '''"compost docker TASK ..." prints a message per category if the command passed contains errors'''
+
+        msgs = run(self._VS['args']['dkr_task_err'], capture_output=True).stderr.decode()
+        msgs_lines = msgs.strip().split('\n')
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertEqual(2, len(msgs_lines))
+        self.assertIn("required", msgs_lines[0])
+        self.assertIn("unrecognized", msgs_lines[1])
+
+    def test_compost_task_id_error(self):
+        '''"compost TASK ID" prints a message if the ID passed does not exist'''
+
+        next_rowid = self._DB.cur.execute(self._VS['queries']['sel_cmd_nxt_rid']).fetchone()[0]
+
+        msg_expected = f"{MESSAGES['cmd_id_none']} {next_rowid}"
+        msg_received = run([*self._VS['args']['task'], str(next_rowid)], capture_output=True).stderr.decode().strip()
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertEqual(msg_expected, msg_received)
+
+    def test_compost_task_id_update(self):
+        '''"compost TASK ID ..." adds an updated existing record to the command table and prints the ID'''
+
+        cli_id_exs = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().strip()
+        args_upd   = [*self._VS['args']['task_upd'][0:3], cli_id_exs, *self._VS['args']['task_upd'][3:]]
+
+        cli_id_upd = int(run(args_upd, capture_output=True).stdout.decode())
+        row_upd    = self._DB.cur.execute(self._VS['queries']['sel_cmd_by_task'], ['run', str(cli_id_upd)]).fetchone()
+        row_id_upd = row_upd[0]
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertEqual(row_id_upd, cli_id_upd)
+        self.assertEqual(self._VS['rows']['task_upd'][1:], row_upd[1:])
+
+    def test_compost_docker_task_id_update_error(self):
+        '''"compost TASK ID ..." prints a message if the update passed is unsupported'''
+
+        cli_id_exs = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().strip()
+        args_upd   = [*self._VS['args']['task_upd_warn'][0:3], cli_id_exs, *self._VS['args']['task_upd_warn'][3:]]
+
+        msgs = run(args_upd, capture_output=True).stderr.decode()
+        msgs_lines = msgs.strip().split('\n')
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertEqual(1, len(msgs_lines))
+        self.assertIn("unrecognized", msgs_lines[0])
+
+    def test_compost_docker_task_id_update_unavailable(self):
+        '''"compost TASK ID ..." prints a message if the update passed is unavailable for an existing record'''
+
+        # Update to assignment
+
+        cli_id_exs_u2a = run(self._VS['args']['dkr_task_wrn'], capture_output=True).stdout.decode().strip()
+        args_upd_u2a   = [*self._VS['args']['task_upd'][0:3], cli_id_exs_u2a, *self._VS['args']['task_upd'][3:]]
+
+        msg_u2a_expected = f"{MESSAGES['cmd_no_update']} {cli_id_exs_u2a}"
+        msg_u2a_received = run(args_upd_u2a, capture_output=True).stderr.decode().strip()
+
+        # Update to update
+
+        cli_id_exs_u2u = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().strip()
+        args_upd_u2u_1 = [*self._VS['args']['task_upd_warn'][0:3], cli_id_exs_u2u, *self._VS['args']['task_upd_warn'][3:]]
+        cli_id_upd_u2u = run(args_upd_u2u_1, capture_output=True).stdout.decode().strip()
+        args_upd_u2u_2 = [*self._VS['args']['task_upd'][0:3], cli_id_upd_u2u, *self._VS['args']['task_upd'][3:]]
+
+        msg_u2u_expected = f"{MESSAGES['cmd_no_update']} {cli_id_upd_u2u}"
+        msg_u2u_received = run(args_upd_u2u_2, capture_output=True).stderr.decode().strip()
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertEqual(msg_u2a_expected, msg_u2a_received)
+        self.assertEqual(msg_u2u_expected, msg_u2u_received)
+
+    def test_compost_task_ls_id(self):
+        '''"compost TASK ls ID" lists command ID and string pairs for a task per the command table'''
+
+        run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode()
+        run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode()
+        cli_list = run(self._VS['args']['task_ls'], capture_output=True).stdout.decode()
+
+        self.assertEqual(cli_list, self._VS['strs']['list_dkr_task_2'])
+
+    def test_compost_task_rm_id(self):
+        '''"compost TASK rm ID" removes a record from the command table'''
+
+        max_rowid_pre  = self._DB.cur.execute(self._VS['queries']['sel_cmd_max_rid']).fetchone()[0]
+
+        cli_id = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode()
+        run([*self._VS['args']['task_rm'], cli_id])
+
+        max_rowid_post = self._DB.cur.execute(self._VS['queries']['sel_cmd_max_rid']).fetchone()[0]
+
+        self.assertEqual(max_rowid_pre, max_rowid_post)
+
+    def test_compost_task_rm_id_err(self):
+        '''"compost TASK rm ID" prints a message if the ID passed does not exist'''
+
+        next_rowid = self._DB.cur.execute(self._VS['queries']['sel_cmd_nxt_rid']).fetchone()[0]
+
+        msg_expected = f"{MESSAGES['cmd_id_none']} {next_rowid}"
+        msg_received = run([*self._VS['args']['task_rm'], str(next_rowid)], capture_output=True).stderr.decode().strip()
+
+        self.assertEqual(msg_expected, msg_received)
+
+    def test_compost_help_or_compost(self):
+        '''"compost help/--help/-h" / "compost" prints help text'''
+
+        help_word_received   = run([*self._VS['args']['help_word']], capture_output=True).stdout.decode().strip()
+        help_flag_w_received = run([*self._VS['args']['help_flag_w']], capture_output=True).stdout.decode().strip()
+        help_flag_c_received = run([*self._VS['args']['help_flag_c']], capture_output=True).stdout.decode().strip()
+        args_1_msg_received  = run([*self._VS['args']['err_1']], capture_output=True).stdout.decode().strip()
+
+        self.assertTrue(all([kw in help_word_received   for kw in self._VS['sets']['keywords']]))
+        self.assertTrue(all([kw in help_flag_w_received for kw in self._VS['sets']['keywords']]))
+        self.assertTrue(all([kw in help_flag_c_received for kw in self._VS['sets']['keywords']]))
+        self.assertTrue(all([kw in args_1_msg_received  for kw in self._VS['sets']['keywords']]))
+
+    def test_compost_error(self):
+        '''"compost ..." prints a message if the command is not supported'''
+
+        args_2_msg_expected = f"{MESSAGES['cmd_none']} '{' '.join([self._VS['args']['err_2'][0], *self._VS['args']['err_2'][2:]])}'"
+        args_3_msg_expected = f"{MESSAGES['cmd_none']} '{' '.join([self._VS['args']['err_3'][0], *self._VS['args']['err_3'][2:]])}'"
+
+        args_2_msg_received = run([*self._VS['args']['err_2']], capture_output=True).stderr.decode().strip()
+        args_3_msg_received = run([*self._VS['args']['err_3']], capture_output=True).stderr.decode().strip()
+
+        self.assertEqual(args_2_msg_expected, args_2_msg_received)
+        self.assertEqual(args_3_msg_expected, args_3_msg_received)
+
+    @classmethod
+    def tearDownClass(cls):
+      remove(PATH_DB_TEST)
+
+
+def test_handle(args: list[str], db: DB = db) -> None:
+    unittest.main(argv=[args[0]])
+
+
+# Initiation
+
+if __name__ == '__main__':
+    init(argv if not IS_TEST else [argv[0], *argv[2:]])
