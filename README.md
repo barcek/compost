@@ -2,9 +2,11 @@
 
 Recycle Docker commands.
 
+A CLI tool for command storage, rerun and modification, with type annotation and a self-test.
+
 ## Why?
 
-For the flexibility of single containers with the more preset approach of Compose.
+For the flexibility of single containers with the more preset approach of Compose. Useful for learning what Docker can do without the initial overhead of remembering specific commands, and once comfortable as a tool for iterating towards a preferred container set.
 
 ## How?
 
@@ -24,13 +26,13 @@ compost run <ID>
 
 The command can be deleted from the store with the additional argument `rm`, e.g. `compost run rm <ID>`, and all commands stored can be listed with `ls`, e.g. `compost run ls`. Usage can be seen with `compost help`, or with the `--help` or `-h` flag.
 
-Currently supported are the `run` and `exec` tasks, for positional arguments and the subset of options which offer a short flag, plus `--name` and `--rm`. Multipart positional arguments such as commands should be passed as a single string. The flags available and action performed for each by `ArgumentParser` are defined close to the top of the source file.
+Currently supported are the `run` and `exec` tasks, for positional arguments and a subset of the options offering a short flag, plus `--name` and `--rm`. Multipart positional arguments such as commands should be passed as a single string. The flags available and action performed for each by `ArgumentParser` are defined close to the top of the source file.
 
 ### Rerunning with changes
 
 A stored command can be rerun with changes by passing the arguments to be changed after the ID.
 
-```shell
+```
 compost run <ID> ...
 ```
 
@@ -71,6 +73,8 @@ The source file is written in Python 3.11 using the standard library only, with 
 On a Linux system with a compatible version of Python installed, the source file can be run with the command `python3 compost` while in the same directory, and from elsewhere using the pattern `python3 path/to/compost`.
 
 Alternatively, it can be run with only `./compost` / `path/to/compost`, by first making it executable, if not already, with `chmod +x compost`. Once executable, it can be run from any directory with the simpler `compost` by placing it in a directory listed on the `$PATH` environment variable, e.g. '/bin' or '/usr/bin'.
+
+The hashbang at the top of the file assumes the presence of Python 3.11 in '/user/bin', the source code that Docker itself is installed and can be invoked directly with `docker`.
 
 ## Code verification
 
