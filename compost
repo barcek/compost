@@ -1,6 +1,6 @@
 #!/usr/bin/python3.11
 
-# compost v 1.0.1
+# compost v 1.0.2
 #  ©2023 barcek #
 #  License: MIT #
 ##   @ github.com
@@ -24,6 +24,7 @@ from sqlite3 import connect
 from argparse import ArgumentParser
 from json import dumps, loads
 from sys import argv, stderr
+from inspect import getfullargspec
 from subprocess import run
 import unittest
 
@@ -116,6 +117,20 @@ def fail_with(message: str) -> None:
     show(message, file=stderr)
     exit(1)
 
+def snap(fn: Callable, args_vals: list[Any]) -> None:
+    """
+    Prints a message generated for the purpose of testing with side effects
+    for a function and set of argument values passed
+    """
+    args_keys = getfullargspec(fn).args
+    args_list = ', '.join([f'{k}: {v} ({v.__class__.__name__})'
+        for k, v in zip(args_keys, args_vals)])
+    show(f'[TEST] {fn.__name__} | {args_list}')
+
+def exec(command: str) -> None:
+    if IS_TEST:
+        return snap(exec, [command])
+    system(command)
 
 # Argument handlers
 
@@ -497,8 +512,7 @@ class Command:
         """
         Returns the instance once its command has been run
         """
-        if not IS_TEST:
-            system(self.to_str())
+        exec(self.to_str())
         return self
 
     def to_str(self) -> str:
@@ -589,6 +603,7 @@ class TestCompost(unittest.TestCase):
             'task_upd': (2, '{"pairs": {"detach": false, "env": "TEST=test", "hostname": null, "interactive": false, "label": null, "name": null, "publish": null, "rm": false, "tty": false, "user": null, "volume": null, "image": "test:1.0.1", "command": []}, "_args": {"wrng_asg": [], "wrng_upd": []}, "notes": {"failures": [], "warnings": []}}', 2)
         },
         'strs': {
+            'line_dkr_task':      'docker run --detach --env TEST=test test:1.0.0',
             'list_dkr_task_2': '1: docker run --detach --env TEST=test test:1.0.0\n2: docker run --detach --env TEST=test test:1.0.0\n'
         },
         'queries': {
@@ -607,16 +622,20 @@ class TestCompost(unittest.TestCase):
       cls._DB = DB(PATH_DB_TEST, MIGRATIONS)
 
     def test_compost_docker_task(self):
-        '''"compost docker TASK ..." adds a record to the command table and prints the ID'''
+        '''"compost docker TASK ..." adds a record to the command table, prints the ID and runs the command'''
 
-        cli_id = int(run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode())
-        row    = self._DB.cur.execute(self._VS['queries']['sel_cmd_by_task'], ['run', str(cli_id)]).fetchone()
-        row_id = row[0]
+        cli_lines = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode()
+        cli_id, msg_test = cli_lines.strip().split('\n')
+
+        row = self._DB.cur.execute(self._VS['queries']['sel_cmd_by_task'], ['run', str(cli_id)]).fetchone()
+        row_id = str(row[0])
 
         self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
         self._DB.con.commit()
 
         self.assertEqual(row_id, cli_id)
+        self.assertIn('[TEST]', msg_test)
+        self.assertIn(self._VS['strs']['line_dkr_task'], msg_test)
         self.assertEqual(self._VS['rows']['dkr_task'][1:], row[1:])
 
     def test_compost_docker_task_error(self):
@@ -632,6 +651,18 @@ class TestCompost(unittest.TestCase):
         self.assertIn("required", msgs_lines[0])
         self.assertIn("unrecognized", msgs_lines[1])
 
+    def test_compost_task_id(self):
+        '''"compost TASK ID" runs the command for the ID passed'''
+
+        cli_id_exs = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().split('\n')[0]
+        msg_test = run([*self._VS['args']['task'], cli_id_exs], capture_output=True).stdout.decode()
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertIn('[TEST]', msg_test)
+        self.assertIn(self._VS['strs']['line_dkr_task'], msg_test)
+
     def test_compost_task_id_error(self):
         '''"compost TASK ID" prints a message if the ID passed does not exist'''
 
@@ -640,20 +671,17 @@ class TestCompost(unittest.TestCase):
         msg_expected = f"{MESSAGES['cmd_id_none']} {next_rowid}"
         msg_received = run([*self._VS['args']['task'], str(next_rowid)], capture_output=True).stderr.decode().strip()
 
-        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
-        self._DB.con.commit()
-
         self.assertEqual(msg_expected, msg_received)
 
     def test_compost_task_id_update(self):
         '''"compost TASK ID ..." adds an updated existing record to the command table and prints the ID'''
 
-        cli_id_exs = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().strip()
+        cli_id_exs = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().split('\n')[0]
         args_upd   = [*self._VS['args']['task_upd'][0:3], cli_id_exs, *self._VS['args']['task_upd'][3:]]
 
-        cli_id_upd = int(run(args_upd, capture_output=True).stdout.decode())
+        cli_id_upd = run(args_upd, capture_output=True).stdout.decode().split('\n')[0]
         row_upd    = self._DB.cur.execute(self._VS['queries']['sel_cmd_by_task'], ['run', str(cli_id_upd)]).fetchone()
-        row_id_upd = row_upd[0]
+        row_id_upd = str(row_upd[0])
 
         self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
         self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
@@ -665,12 +693,13 @@ class TestCompost(unittest.TestCase):
     def test_compost_docker_task_id_update_error(self):
         '''"compost TASK ID ..." prints a message if the update passed is unsupported'''
 
-        cli_id_exs = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().strip()
+        cli_id_exs = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().split('\n')[0]
         args_upd   = [*self._VS['args']['task_upd_warn'][0:3], cli_id_exs, *self._VS['args']['task_upd_warn'][3:]]
 
         msgs = run(args_upd, capture_output=True).stderr.decode()
         msgs_lines = msgs.strip().split('\n')
 
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
         self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
         self._DB.con.commit()
 
@@ -682,7 +711,7 @@ class TestCompost(unittest.TestCase):
 
         # Update to assignment
 
-        cli_id_exs_u2a = run(self._VS['args']['dkr_task_wrn'], capture_output=True).stdout.decode().strip()
+        cli_id_exs_u2a = run(self._VS['args']['dkr_task_wrn'], capture_output=True).stdout.decode().split('\n')[0]
         args_upd_u2a   = [*self._VS['args']['task_upd'][0:3], cli_id_exs_u2a, *self._VS['args']['task_upd'][3:]]
 
         msg_u2a_expected = f"{MESSAGES['cmd_no_update']} {cli_id_exs_u2a}"
@@ -690,9 +719,9 @@ class TestCompost(unittest.TestCase):
 
         # Update to update
 
-        cli_id_exs_u2u = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().strip()
+        cli_id_exs_u2u = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().split('\n')[0]
         args_upd_u2u_1 = [*self._VS['args']['task_upd_warn'][0:3], cli_id_exs_u2u, *self._VS['args']['task_upd_warn'][3:]]
-        cli_id_upd_u2u = run(args_upd_u2u_1, capture_output=True).stdout.decode().strip()
+        cli_id_upd_u2u = run(args_upd_u2u_1, capture_output=True).stdout.decode().split('\n')[0]
         args_upd_u2u_2 = [*self._VS['args']['task_upd'][0:3], cli_id_upd_u2u, *self._VS['args']['task_upd'][3:]]
 
         msg_u2u_expected = f"{MESSAGES['cmd_no_update']} {cli_id_upd_u2u}"
@@ -713,6 +742,10 @@ class TestCompost(unittest.TestCase):
         run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode()
         cli_list = run(self._VS['args']['task_ls'], capture_output=True).stdout.decode()
 
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
         self.assertEqual(cli_list, self._VS['strs']['list_dkr_task_2'])
 
     def test_compost_task_rm_id(self):
@@ -720,7 +753,7 @@ class TestCompost(unittest.TestCase):
 
         max_rowid_pre  = self._DB.cur.execute(self._VS['queries']['sel_cmd_max_rid']).fetchone()[0]
 
-        cli_id = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode()
+        cli_id = run(self._VS['args']['dkr_task'], capture_output=True).stdout.decode().strip().split('\n')[0]
         run([*self._VS['args']['task_rm'], cli_id])
 
         max_rowid_post = self._DB.cur.execute(self._VS['queries']['sel_cmd_max_rid']).fetchone()[0]
