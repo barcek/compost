@@ -1,5 +1,11 @@
 #!/usr/bin/python3.11
 
+# compost v 1.0.1
+#  ©2023 barcek #
+#  License: MIT #
+##   @ github.com
+# /barcek/compost
+
 """
 Provides a simple DB class and a Mapper, Config and Command class set,
 plus the corresponding migrations, type aliases and utility functions,
