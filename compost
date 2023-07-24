@@ -1,6 +1,6 @@
 #!/usr/bin/python3.11
 
-# compost v 1.0.2
+# compost v 1.1.0
 #  ©2023 barcek #
 #  License: MIT #
 ##   @ github.com
@@ -84,6 +84,28 @@ TASKS = {
     }
 }
 
+settings = {
+  'do_defer': False,
+  'do_print': False
+}
+
+CLI_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
+
+  'invocation': {
+
+    'do_defer': {
+      'flags': ['--defer', '-d'],
+      'label': 'store the command without running',
+      'apply': lambda: True
+    },
+    'do_print': {
+      'flags': ['--print', '-p'],
+      'label': 'show the command stored',
+      'apply': lambda: True
+    }
+  }
+}
+
 
 # Constants & type aliases
 
@@ -139,11 +161,20 @@ def help_handle(args: list[str], db: DB) -> None:
     Prints help text
     """
     tasks = '/'.join(TASKS.keys())
+    flags = '|'.join([
+        v['flags'][1]
+        for v in CLI_OPTIONS['invocation'].values()
+    ])
+    flags_lines = '\n'.join([
+        f' {v["flags"][1]}, {v["flags"][0]}\t{v["label"]}'
+        for v in CLI_OPTIONS['invocation'].values()
+    ])
     lines = [
-       f'Usage: compost docker {tasks} ...',
-       f'       compost {tasks} ID[ ...]',
+       f'Usage: compost [{flags}] docker {tasks} ...',
+       f'       compost {tasks} [{flags}] ID[ ...]',
        f'       compost {tasks} ls / rm ID',
-        '       compost [--]help/-h / test'
+        '       compost [--]help/-h / test',
+       f'Flags:\n{flags_lines}'
     ]
     show('\n'.join(lines))
 
@@ -510,9 +541,14 @@ class Command:
 
     def invoke(self) -> Command:
         """
-        Returns the instance once its command has been run
+        Returns the instance once its command has been run per settings
+        for print and defer
         """
-        exec(self.to_str())
+        s = self.to_str()
+        if settings['do_print']:
+            show(s)
+        if not settings['do_defer']:
+            exec(s)
         return self
 
     def to_str(self) -> str:
@@ -534,7 +570,29 @@ def init(argv: list[str] = argv) -> None:
     Invokes a handler per argv, passing a subset and the DB instance
     """
 
-    argc = len(argv)
+    # Identify any flags and apply options
+
+    flag_start_i = 2 if len(argv) > 2 and argv[1] in TASKS.keys() else\
+                   1 if len(argv) > 1 else 0
+
+    prefixed_count = 0
+
+    for arg in argv[flag_start_i:]:
+        if arg.startswith('-'):
+            prefixed_count = prefixed_count + 1
+            for k, v in CLI_OPTIONS['invocation'].items():
+                if arg in v['flags']:
+                    settings[k] = v['apply']()
+                    break
+        else:
+            break
+
+    # Update argv for prefixed args found
+
+    main_start_i = prefixed_count + flag_start_i
+    argv = [*argv[:flag_start_i], *argv[main_start_i:]]
+
+    # Define argc-to-handler maps and use
 
     argc_2_only: dict[str, Callable] = {
 
@@ -559,6 +617,7 @@ def init(argv: list[str] = argv) -> None:
         }
     }
 
+    argc = len(argv)
     fail = lambda: fail_with(f"{MESSAGES['cmd_none']} '{' '.join(argv)}'")
     args = argv[1:]
 
@@ -583,20 +642,26 @@ class TestCompost(unittest.TestCase):
     _VS: dict[str, dict[str, Any]] = {
 
         'args': {
-            'dkr_task':      [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-de', 'TEST=test', 'test:1.0.0'],
-            'dkr_task_wrn':  [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-xyz', 'test:1.0.0'],
-            'dkr_task_err':  [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-xyz'],
-            'task_upd':      [argv[0], 'COMPOST_TESTING', 'run', '-d', 'test:1.0.1'], # ID required
-            'task_upd_warn': [argv[0], 'COMPOST_TESTING', 'run', '-xyz'],             # ID required
-            'task':          [argv[0], 'COMPOST_TESTING', 'run'],                     # ID required
-            'task_rm':       [argv[0], 'COMPOST_TESTING', 'run', 'rm'],               # ID required
-            'task_ls':       [argv[0], 'COMPOST_TESTING', 'run', 'ls'],
-            'help_word':     [argv[0], 'COMPOST_TESTING', 'help'],
-            'help_flag_w':   [argv[0], 'COMPOST_TESTING', '--help'],
-            'help_flag_c':   [argv[0], 'COMPOST_TESTING', '-h'],
-            'err_1':         [argv[0], 'COMPOST_TESTING'],
-            'err_2':         [argv[0], 'COMPOST_TESTING', 'none'],
-            'err_3':         [argv[0], 'COMPOST_TESTING', 'none', 'run']
+            'dkr_task':       [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-de', 'TEST=test', 'test:1.0.0'],
+            'dkr_task_opt_d': [argv[0], 'COMPOST_TESTING', '--defer', 'docker', 'run', '-de', 'TEST=test', 'test:1.0.0'],
+            'dkr_task_opt_p': [argv[0], 'COMPOST_TESTING', '--print', 'docker', 'run', '-de', 'TEST=test', 'test:1.0.0'],
+            'dkr_task_wrn':   [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-xyz', 'test:1.0.0'],
+            'dkr_task_err':   [argv[0], 'COMPOST_TESTING', 'docker', 'run', '-xyz'],
+            'task':           [argv[0], 'COMPOST_TESTING', 'run'],                                # ID required
+            'task_opt_d':     [argv[0], 'COMPOST_TESTING', 'run', '--defer'],                     # ID required
+            'task_opt_p':     [argv[0], 'COMPOST_TESTING', 'run', '--print'],                     # ID required
+            'task_upd':       [argv[0], 'COMPOST_TESTING', 'run', '-d', 'test:1.0.1'],            # ID required
+            'task_upd_opt_d': [argv[0], 'COMPOST_TESTING', 'run', '--defer', '-d', 'test:1.0.1'], # ID required
+            'task_upd_opt_p': [argv[0], 'COMPOST_TESTING', 'run', '--print', '-d', 'test:1.0.1'], # ID required
+            'task_upd_warn':  [argv[0], 'COMPOST_TESTING', 'run', '-xyz'],                        # ID required
+            'task_rm':        [argv[0], 'COMPOST_TESTING', 'run', 'rm'],                          # ID required
+            'task_ls':        [argv[0], 'COMPOST_TESTING', 'run', 'ls'],
+            'help_word':      [argv[0], 'COMPOST_TESTING', 'help'],
+            'help_flag_w':    [argv[0], 'COMPOST_TESTING', '--help'],
+            'help_flag_c':    [argv[0], 'COMPOST_TESTING', '-h'],
+            'err_1':          [argv[0], 'COMPOST_TESTING'],
+            'err_2':          [argv[0], 'COMPOST_TESTING', 'none'],
+            'err_3':          [argv[0], 'COMPOST_TESTING', 'none', 'run']
         },
         'rows': {
             'dkr_task': (1, '{"pairs": {"detach": true, "env": "TEST=test", "hostname": null, "interactive": false, "label": null, "name": null, "publish": null, "rm": false, "tty": false, "user": null, "volume": null, "image": "test:1.0.0", "command": []}, "_args": {"wrng_asg": [], "wrng_upd": []}, "notes": {"failures": [], "warnings": []}}', 2),
@@ -604,7 +669,8 @@ class TestCompost(unittest.TestCase):
         },
         'strs': {
             'line_dkr_task':      'docker run --detach --env TEST=test test:1.0.0',
-            'list_dkr_task_2': '1: docker run --detach --env TEST=test test:1.0.0\n2: docker run --detach --env TEST=test test:1.0.0\n'
+            'list_dkr_task_2': '1: docker run --detach --env TEST=test test:1.0.0\n2: docker run --detach --env TEST=test test:1.0.0\n',
+            'line_task_upd':      'docker run --env TEST=test test:1.0.1'
         },
         'queries': {
             'sel_cmd_by_task': 'SELECT command.id, command.config, command.task_rowid FROM command INNER JOIN task ON task.rowid = command.task_rowid WHERE task.name = ? AND command.id = ?',
@@ -613,7 +679,7 @@ class TestCompost(unittest.TestCase):
             'del_cmd_max_rid': 'DELETE FROM command WHERE rowid = (SELECT MAX(rowid) from command)'
         },
         'sets': {
-            'keywords': ['compost', 'docker', 'exec', 'run', 'ID', 'ls', 'rm', 'help', 'test']
+            'keywords': ['compost', 'docker', 'exec', 'run', 'ID', 'ls', 'rm', 'help', 'test', '-d', '-p', 'Flags', '--defer', '--print']
         }
     }
 
@@ -734,6 +800,46 @@ class TestCompost(unittest.TestCase):
 
         self.assertEqual(msg_u2a_expected, msg_u2a_received)
         self.assertEqual(msg_u2u_expected, msg_u2u_received)
+
+    def test_compost_option_defer(self):
+        '''"compost --defer docker ... / TASK --defer ID[ ...]" stores the command without running'''
+
+        dkr_lines  = run(self._VS['args']['dkr_task_opt_d'], capture_output=True).stdout.decode().strip().split('\n')
+        dkr_cli_id = dkr_lines[0]
+
+        task_lines = run([*self._VS['args']['task_opt_d'], dkr_cli_id], capture_output=True).stdout.decode().strip().split('\n')
+
+        args_upd  = [*self._VS['args']['task_upd_opt_d'][0:4], dkr_cli_id, *self._VS['args']['task_upd_opt_d'][4:]]
+        upd_lines = run(args_upd, capture_output=True).stdout.decode().strip().split('\n')
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertEqual(1, len(dkr_lines))
+        self.assertEqual(1, len(task_lines))
+        self.assertEqual(1, len(upd_lines))
+
+    def test_compost_option_print(self):
+        '''"compost --print docker ... / TASK --print ID[ ...]" shows the command stored'''
+
+        dkr_lines = run(self._VS['args']['dkr_task_opt_p'], capture_output=True).stdout.decode().strip().split('\n')
+        dkr_cli_id, dkr_cli_cmd, _ = dkr_lines
+
+        task_cli_cmd = run([*self._VS['args']['task_opt_p'], dkr_cli_id], capture_output=True).stdout.decode().strip().split('\n')[0]
+
+        args_upd    = [*self._VS['args']['task_upd_opt_p'][0:4], dkr_cli_id, *self._VS['args']['task_upd_opt_p'][4:]]
+        upd_cli_cmd = run(args_upd, capture_output=True).stdout.decode().strip().split('\n')[1]
+
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.cur.execute(self._VS['queries']['del_cmd_max_rid'])
+        self._DB.con.commit()
+
+        self.assertEqual(self._VS['strs']['line_dkr_task'], dkr_cli_cmd)
+        self.assertEqual(self._VS['strs']['line_dkr_task'], task_cli_cmd)
+        self.assertEqual(self._VS['strs']['line_task_upd'], upd_cli_cmd)
 
     def test_compost_task_ls_id(self):
         '''"compost TASK ls ID" lists command ID and string pairs for a task per the command table'''
