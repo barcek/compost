@@ -1,6 +1,6 @@
 #!/usr/bin/python3.11
 
-# compost v 1.1.0
+# compost v 1.1.1
 #  ©2023 barcek #
 #  License: MIT #
 ##   @ github.com
@@ -234,9 +234,9 @@ class Mapper:
         self.parameters = parameters
         self.parser = self._Parser(add_help=False)
 
-        for item in self.parameters:
-            flags = list(filter(lambda flag: flag, item[:-1]))
-            self.parser.add_argument(*flags, **item[-1])
+        for parameter in self.parameters:
+            flags = [item for item in parameter[:-1] if item]
+            self.parser.add_argument(*flags, **parameter[-1])
 
     def args_to_values(self, args: list[str], **kwargs) -> ConfigVals:
         """
@@ -343,10 +343,9 @@ class Config:
         Returns the instance with the values property remapped per args,
         toggling boolean values and replacing others
         """
-        values = self.mapper.args_to_values(args, is_update=True)
-        self.values['notes'] = values['notes']
-        self.values['_args'] = values['_args']
-        for k, v in values['pairs'].items():
+        pairs, _args, notes = self.mapper.args_to_values(args, is_update=True).values()
+        self.values.update({'notes': notes, '_args': _args})
+        for k, v in pairs.items():
             if v is True or k not in self.values['pairs'] or\
                 (v and v != self.values['pairs'][k]):
                 self.values['pairs'][k] = not self.values['pairs'][k]\
@@ -361,9 +360,9 @@ class Config:
         else returns the instance
         """
         if not kwargs.get('is_internal'):
-            for key in self.values['notes']:
-                for body in self.values['notes'][key]:
-                   show(f'Note: {body}', file=stderr)
+            for notes in self.values['notes'].values():
+                for note in notes:
+                   show(f'Note: {note}', file=stderr)
             if self.values['notes']['failures']:
                 exit(1)
         return self
