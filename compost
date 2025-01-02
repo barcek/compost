@@ -1,6 +1,6 @@
 #!/usr/bin/python3.11
 
-# compost v 1.1.1
+# compost v 1.1.2
 #  ©2023 barcek #
 #  License: MIT #
 ##   @ github.com
@@ -89,6 +89,12 @@ settings = {
   'do_print': False
 }
 
+def help_handle(args: list[str], db: DB) -> None:
+    show_help_text()
+
+def test_handle(args: list[str], db: DB) -> None:
+    unittest.main(argv=[args[0]])
+
 CLI_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
 
   'invocation': {
@@ -96,12 +102,26 @@ CLI_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
     'do_defer': {
       'flags': ['--defer', '-d'],
       'label': 'store the command without running',
-      'apply': lambda: True
+      'apply': lambda argv, db: True,
+      'is_or': False
     },
     'do_print': {
       'flags': ['--print', '-p'],
       'label': 'show the command stored',
-      'apply': lambda: True
+      'apply': lambda argv, db: True,
+      'is_or': False
+    },
+    'do_help': {
+      'flags': ['--help', '-h'],
+      'label': 'show help text then exit',
+      'apply': help_handle,
+      'is_or': True
+    },
+    'do_test': {
+      'flags': ['--test', '-t'],
+      'label': 'perform the self-test then exit',
+      'apply': test_handle,
+      'is_or': True
     }
   }
 }
@@ -112,6 +132,7 @@ CLI_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
 IS_TEST = len(argv) > 1 and 'COMPOST_TESTING' == argv[1]
 
 MESSAGES = {
+    'opt_none':      'No support for option with flag',
     'cmd_none':      'No support for command',
     'cmd_id_none':   'No command found for ID',
     'cmd_no_update': 'Update unavailable for command with ID'
@@ -131,6 +152,28 @@ def show(message: Any, **kwargs) -> None:
     """
     print(str(message), **kwargs)
 
+def show_help_text() -> None:
+    """
+    Prints help text
+    """
+    tasks = '/'.join(TASKS.keys())
+    flags = '|'.join([
+        v['flags'][1]
+        for v in CLI_OPTIONS['invocation'].values() if not v['is_or']
+    ])
+    flags_lines = '\n'.join([
+        f' {v["flags"][1]}, {v["flags"][0]}\t{v["label"]}'
+        for v in CLI_OPTIONS['invocation'].values()
+    ])
+    lines = [
+       f'Usage: compost [{flags}] docker {tasks} ...',
+       f'       compost {tasks} [{flags}] ID[ ...]',
+       f'       compost {tasks} ls / rm ID',
+        '       compost help / test',
+       f'Flags:\n{flags_lines}'
+    ]
+    show('\n'.join(lines))
+    exit(0)
 
 def fail_with(message: str) -> None:
     """
@@ -153,30 +196,6 @@ def exec(command: str) -> None:
     if IS_TEST:
         return snap(exec, [command])
     system(command)
-
-# Argument handlers
-
-def help_handle(args: list[str], db: DB) -> None:
-    """
-    Prints help text
-    """
-    tasks = '/'.join(TASKS.keys())
-    flags = '|'.join([
-        v['flags'][1]
-        for v in CLI_OPTIONS['invocation'].values()
-    ])
-    flags_lines = '\n'.join([
-        f' {v["flags"][1]}, {v["flags"][0]}\t{v["label"]}'
-        for v in CLI_OPTIONS['invocation'].values()
-    ])
-    lines = [
-       f'Usage: compost [{flags}] docker {tasks} ...',
-       f'       compost {tasks} [{flags}] ID[ ...]',
-       f'       compost {tasks} ls / rm ID',
-        '       compost [--]help/-h / test',
-       f'Flags:\n{flags_lines}'
-    ]
-    show('\n'.join(lines))
 
 
 # Data structures, general
@@ -569,38 +588,14 @@ def init(argv: list[str] = argv) -> None:
     Invokes a handler per argv, passing a subset and the DB instance
     """
 
-    # Identify any flags and apply options
+    # Define argument handling maps
 
-    flag_start_i = 2 if len(argv) > 2 and argv[1] in TASKS.keys() else\
-                   1 if len(argv) > 1 else 0
+    singles: dict[str, Callable] = {
 
-    prefixed_count = 0
-
-    for arg in argv[flag_start_i:]:
-        if arg.startswith('-'):
-            prefixed_count = prefixed_count + 1
-            for k, v in CLI_OPTIONS['invocation'].items():
-                if arg in v['flags']:
-                    settings[k] = v['apply']()
-                    break
-        else:
-            break
-
-    # Update argv for prefixed args found
-
-    main_start_i = prefixed_count + flag_start_i
-    argv = [*argv[:flag_start_i], *argv[main_start_i:]]
-
-    # Define argc-to-handler maps and use
-
-    argc_2_only: dict[str, Callable] = {
-
-        '-h':       help_handle,
-        '--help':   help_handle,
         'help':     help_handle,
         'test':     test_handle
     }
-    argc_3_plus: dict[str, dict[str, Callable]] = {
+    doubles: dict[str, dict[str, Callable]] = {
 
         'run':  {
             'ls':   Command.output_all,
@@ -616,21 +611,54 @@ def init(argv: list[str] = argv) -> None:
         }
     }
 
-    argc = len(argv)
-    fail = lambda: fail_with(f"{MESSAGES['cmd_none']} '{' '.join(argv)}'")
-    args = argv[1:]
+    # Process arguments per expected patterns:
+    # - compost [flag(s)] docker <TASK> ...
+    # - compost <TASK> [flag(s)] ID[ ...]
+    # - compost <TASK> <abbr> ID
+    # - compost help / test
 
-    match argc:
-        case 1:
-            help_handle(args, db)
-        case 2:
-            if argv[1] not in argc_2_only: fail()
-            argc_2_only[argv[1]](args, db)
-        case _:
-           if argv[1] not in argc_3_plus: fail()
-           argc_3_plus[argv[1]].get(\
-               argv[2], Command.invoke_one # default handler for argv[2] is ID\
-           )(args, db)
+    # Apply simple actions
+
+    if len(argv) == 1:
+        help_handle([], db)
+
+    if argv[1] in singles:
+        singles[argv[1]](argv, db)
+
+    # Identify any flags and apply options
+
+    flag_start_i = 2 if argv[1] in TASKS.keys() else 1
+    flag_count = 0
+
+    for arg in argv[flag_start_i:]:
+        is_counted = False
+        if arg.startswith('-'):
+            for k, v in CLI_OPTIONS['invocation'].items():
+                if arg in v['flags']:
+                    settings[k] = v['apply'](argv[0], DB)
+                    flag_count = flag_count + 1
+                    is_counted = True
+                    break
+            if not is_counted:
+                fail_with(f"{MESSAGES['opt_none']} '{arg}'")
+        else:
+            break
+
+    # Update args for flags found
+
+    main_start_i = flag_count + flag_start_i
+    args = [*argv[:flag_start_i], *argv[main_start_i:]]
+
+    if args[1] not in doubles:
+        fail_with(f"{MESSAGES['cmd_none']} '{' '.join(argv)}'")
+
+    # Apply more complex actions
+
+    doubles[args[1]].get(
+        args[2],
+        Command.invoke_one if args[1] in TASKS.keys() # default handler for argv[2] is ID\
+            else lambda args, db: fail_with(f"{MESSAGES['cmd_none']} '{' '.join(argv)}'")
+    )(args[1:], db)
 
 
 # Data structures & primary functions, test
@@ -660,7 +688,8 @@ class TestCompost(unittest.TestCase):
             'help_flag_c':    [argv[0], 'COMPOST_TESTING', '-h'],
             'err_1':          [argv[0], 'COMPOST_TESTING'],
             'err_2':          [argv[0], 'COMPOST_TESTING', 'none'],
-            'err_3':          [argv[0], 'COMPOST_TESTING', 'none', 'run']
+            'err_f_d':        [argv[0], 'COMPOST_TESTING', '--none', 'docker', 'run', '-de', 'TEST=test', 'test:1.0.0'],
+            'err_f_t':        [argv[0], 'COMPOST_TESTING', 'run', '--none', '1']
         },
         'rows': {
             'dkr_task': (1, '{"pairs": {"detach": true, "env": "TEST=test", "hostname": null, "interactive": false, "label": null, "name": null, "publish": null, "rm": false, "tty": false, "user": null, "volume": null, "image": "test:1.0.0", "command": []}, "_args": {"wrng_asg": [], "wrng_upd": []}, "notes": {"failures": [], "warnings": []}}', 2),
@@ -678,7 +707,7 @@ class TestCompost(unittest.TestCase):
             'del_cmd_max_rid': 'DELETE FROM command WHERE rowid = (SELECT MAX(rowid) from command)'
         },
         'sets': {
-            'keywords': ['compost', 'docker', 'exec', 'run', 'ID', 'ls', 'rm', 'help', 'test', '-d', '-p', 'Flags', '--defer', '--print']
+            'keywords': ['compost', 'docker', 'exec', 'run', 'ID', 'ls', 'rm', 'help', 'test', '-d', '-p', 'Flags', '--defer', '--print', '--help', '--test']
         }
     }
 
@@ -892,21 +921,20 @@ class TestCompost(unittest.TestCase):
         '''"compost ..." prints a message if the command is not supported'''
 
         args_2_msg_expected = f"{MESSAGES['cmd_none']} '{' '.join([self._VS['args']['err_2'][0], *self._VS['args']['err_2'][2:]])}'"
-        args_3_msg_expected = f"{MESSAGES['cmd_none']} '{' '.join([self._VS['args']['err_3'][0], *self._VS['args']['err_3'][2:]])}'"
+        flag_t_msg_expected = f"{MESSAGES['opt_none']} '{self._VS['args']['err_f_t'][3]}'"
+        flag_d_msg_expected = f"{MESSAGES['opt_none']} '{self._VS['args']['err_f_d'][2]}'"
 
         args_2_msg_received = run([*self._VS['args']['err_2']], capture_output=True).stderr.decode().strip()
-        args_3_msg_received = run([*self._VS['args']['err_3']], capture_output=True).stderr.decode().strip()
+        flag_t_msg_received = run([*self._VS['args']['err_f_t']], capture_output=True).stderr.decode().strip()
+        flag_d_msg_received = run([*self._VS['args']['err_f_d']], capture_output=True).stderr.decode().strip()
 
         self.assertEqual(args_2_msg_expected, args_2_msg_received)
-        self.assertEqual(args_3_msg_expected, args_3_msg_received)
+        self.assertEqual(flag_t_msg_expected, flag_t_msg_received)
+        self.assertEqual(flag_d_msg_expected, flag_d_msg_received)
 
     @classmethod
     def tearDownClass(cls):
       remove(PATH_DB_TEST)
-
-
-def test_handle(args: list[str], db: DB = db) -> None:
-    unittest.main(argv=[args[0]])
 
 
 # Initiation
