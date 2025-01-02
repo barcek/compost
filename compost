@@ -1,6 +1,6 @@
 #!/usr/bin/python3.11
 
-# compost v 1.1.2
+# compost v 1.1.3
 #  ©2023 barcek #
 #  License: MIT #
 ##   @ github.com
@@ -90,7 +90,7 @@ settings = {
 }
 
 def help_handle(args: list[str], db: DB) -> None:
-    show_help_text()
+    show_help_text(0)
 
 def test_handle(args: list[str], db: DB) -> None:
     unittest.main(argv=[args[0]])
@@ -152,7 +152,7 @@ def show(message: Any, **kwargs) -> None:
     """
     print(str(message), **kwargs)
 
-def show_help_text() -> None:
+def show_help_text(code: int) -> None:
     """
     Prints help text
     """
@@ -173,7 +173,7 @@ def show_help_text() -> None:
        f'Flags:\n{flags_lines}'
     ]
     show('\n'.join(lines))
-    exit(0)
+    exit(code)
 
 def fail_with(message: str) -> None:
     """
@@ -620,7 +620,7 @@ def init(argv: list[str] = argv) -> None:
     # Apply simple actions
 
     if len(argv) == 1:
-        help_handle([], db)
+        show_help_text(1)
 
     if argv[1] in singles:
         singles[argv[1]](argv, db)
