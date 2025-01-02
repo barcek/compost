@@ -1,6 +1,6 @@
 #!/usr/bin/python3.11
 
-# compost v 1.1.3
+# compost v 1.2.0
 #  ©2023 barcek #
 #  License: MIT #
 ##   @ github.com
@@ -26,6 +26,7 @@ from json import dumps, loads
 from sys import argv, stderr
 from inspect import getfullargspec
 from subprocess import run
+from re import search
 import unittest
 
 
@@ -89,10 +90,13 @@ settings = {
   'do_print': False
 }
 
-def help_handle(args: list[str], db: DB) -> None:
+def handle_help(args: list[str], db: DB) -> None:
     show_help_text(0)
 
-def test_handle(args: list[str], db: DB) -> None:
+def handle_version(args: list[str], db: DB) -> None:
+    show_core_info()
+
+def handle_test(args: list[str], db: DB) -> None:
     unittest.main(argv=[args[0]])
 
 CLI_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
@@ -114,13 +118,19 @@ CLI_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
     'do_help': {
       'flags': ['--help', '-h'],
       'label': 'show help text then exit',
-      'apply': help_handle,
+      'apply': handle_help,
+      'is_or': True
+    },
+    'do_version': {
+      'flags': ['--version', '-v'],
+      'label': 'show name and version number then exit',
+      'apply': handle_version,
       'is_or': True
     },
     'do_test': {
       'flags': ['--test', '-t'],
       'label': 'perform the self-test then exit',
-      'apply': test_handle,
+      'apply': handle_test,
       'is_or': True
     }
   }
@@ -169,11 +179,21 @@ def show_help_text(code: int) -> None:
        f'Usage: compost [{flags}] docker {tasks} ...',
        f'       compost {tasks} [{flags}] ID[ ...]',
        f'       compost {tasks} ls / rm ID',
-        '       compost help / test',
+        '       compost help / version / test',
        f'Flags:\n{flags_lines}'
     ]
     show('\n'.join(lines))
     exit(code)
+
+def show_core_info() -> None:
+    """
+    Prints name and version number
+    """
+    line = ""
+    with open(Path(argv[0]).resolve(), 'rb') as f:
+        line = f.read()[25:40].decode()
+    show(line)
+    exit(0)
 
 def fail_with(message: str) -> None:
     """
@@ -592,8 +612,9 @@ def init(argv: list[str] = argv) -> None:
 
     singles: dict[str, Callable] = {
 
-        'help':     help_handle,
-        'test':     test_handle
+        'help':     handle_help,
+        'version':  handle_version,
+        'test':     handle_test
     }
     doubles: dict[str, dict[str, Callable]] = {
 
@@ -686,6 +707,9 @@ class TestCompost(unittest.TestCase):
             'help_word':      [argv[0], 'COMPOST_TESTING', 'help'],
             'help_flag_w':    [argv[0], 'COMPOST_TESTING', '--help'],
             'help_flag_c':    [argv[0], 'COMPOST_TESTING', '-h'],
+            'version_word':   [argv[0], 'COMPOST_TESTING', 'version'],
+            'version_flag_w': [argv[0], 'COMPOST_TESTING', '--version'],
+            'version_flag_c': [argv[0], 'COMPOST_TESTING', '-v'],
             'err_1':          [argv[0], 'COMPOST_TESTING'],
             'err_2':          [argv[0], 'COMPOST_TESTING', 'none'],
             'err_f_d':        [argv[0], 'COMPOST_TESTING', '--none', 'docker', 'run', '-de', 'TEST=test', 'test:1.0.0'],
@@ -707,7 +731,7 @@ class TestCompost(unittest.TestCase):
             'del_cmd_max_rid': 'DELETE FROM command WHERE rowid = (SELECT MAX(rowid) from command)'
         },
         'sets': {
-            'keywords': ['compost', 'docker', 'exec', 'run', 'ID', 'ls', 'rm', 'help', 'test', '-d', '-p', 'Flags', '--defer', '--print', '--help', '--test']
+            'keywords': ['compost', 'docker', 'exec', 'run', 'ID', 'ls', 'rm', '-d', '-p', 'Flags', '--defer', '--print', '-h', '--help', '-v', '--version', '-t', '--test']
         }
     }
 
@@ -916,6 +940,19 @@ class TestCompost(unittest.TestCase):
         self.assertTrue(all([kw in help_flag_w_received for kw in self._VS['sets']['keywords']]))
         self.assertTrue(all([kw in help_flag_c_received for kw in self._VS['sets']['keywords']]))
         self.assertTrue(all([kw in args_1_msg_received  for kw in self._VS['sets']['keywords']]))
+
+    def test_compost_version(self):
+        '''"compost version/--version/-v" prints name and version number'''
+
+        version_word_received   = run([*self._VS['args']['version_word']], capture_output=True).stdout.decode().strip()
+        version_flag_w_received = run([*self._VS['args']['version_flag_w']], capture_output=True).stdout.decode().strip()
+        version_flag_c_received = run([*self._VS['args']['version_flag_c']], capture_output=True).stdout.decode().strip()
+
+        pattern = r'compost v\s?\d+.\d+.\d+'
+
+        self.assertTrue(search(pattern, version_word_received))
+        self.assertTrue(search(pattern, version_flag_w_received))
+        self.assertTrue(search(pattern, version_flag_c_received))
 
     def test_compost_error(self):
         '''"compost ..." prints a message if the command is not supported'''
