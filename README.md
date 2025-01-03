@@ -92,6 +92,9 @@ The following can be passed to `compost` either a) before a Docker command or b)
 
 - `--defer` / `-d`, to store the command without running
 - `--print` / `-p`, to show the command stored
+- `--help` / `-h`, to show help text then exit
+- `--version` / `-v`, to show name and version number then exit
+- `--test` / `-t`, to perform the self-test then exit
 
 ## Getting started
 
@@ -105,7 +108,7 @@ The hashbang at the top of the file assumes the presence of Python 3.11 in '/usr
 
 ## Code verification
 
-The test cases can be run with `compost test` (see [Getting started](#getting-started) above). The type annotation can be checked with Mypy, e.g. using the command `mypy --python-version 3.11 compost`.
+The test cases can be run with `compost` followed by `test`, `--test` or `-t` (see [Getting started](#getting-started) and [Options](#options) above). The type annotation can be checked with Mypy, e.g. using the command `mypy --python-version 3.11 compost`.
 
 ## Development plan
 
